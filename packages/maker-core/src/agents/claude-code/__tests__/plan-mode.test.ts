@@ -13,7 +13,7 @@ import path from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import type { AgentDeps } from '../../base-agent.js';
+import type { AgentDeps, RemoteClaudeRoute } from '../../base-agent.js';
 import type { AuthAdapter } from '../../../interfaces/auth-adapter.js';
 import type { PermissionMode } from '../../../types/common.js';
 import type { AgentEvent, InteractionDecision, InteractionRequest } from '../../../types/events.js';
@@ -124,6 +124,8 @@ async function startPlanSession(
   depOverrides: Partial<AgentDeps> = {},
   permissionMode: PermissionMode = 'acceptEdits',
   reviewMode = false,
+  botProfile = false,
+  writableDirs: string[] = [],
 ) {
   const configDir = await makeTempDir();
   process.env.CLAUDE_CONFIG_DIR = configDir;
@@ -139,7 +141,13 @@ async function startPlanSession(
     workingDir,
     permissionMode,
     planMode,
+    ...(writableDirs.length > 0 ? { writableDirs } : {}),
     ...(reviewMode ? { reviewMode: true as const } : {}),
+    ...(botProfile
+      ? {
+          botProfilePrompt: 'BOT SOUL: research without changing the project.',
+        }
+      : {}),
   });
   const queryOptions = sdkMock.query.mock.calls.at(-1)?.[0]?.options as
     | {
@@ -149,6 +157,7 @@ async function startPlanSession(
         settingSources?: string[];
         allowDangerouslySkipPermissions?: boolean;
         settings?: Record<string, unknown>;
+        systemPrompt?: { append?: string };
         hooks?: {
           PreToolUse?: Array<{
             hooks: Array<(input: Record<string, unknown>) => Promise<Record<string, unknown>>>;
@@ -502,6 +511,28 @@ describe('ClaudeCodeAgent plan mode', () => {
     await handle.close();
   });
 
+  it('keeps Bot identity and native tools under ordinary task permissions', async () => {
+    const { handle, queryOptions, fakeQuery } = await startPlanSession(
+      false, {}, 'bypassPermissions', false, true,
+    );
+    expect(queryOptions.permissionMode).toBe('bypassPermissions');
+    expect(queryOptions.allowDangerouslySkipPermissions).toBe(true);
+    expect(queryOptions.systemPrompt?.append).toContain('BOT SOUL');
+    for (const toolName of ['Write', 'Bash']) {
+      for (const group of queryOptions.hooks?.PreToolUse ?? []) {
+        for (const hook of group.hooks) {
+          const decision = await hook({
+            hook_event_name: 'PreToolUse', tool_name: toolName, tool_input: {},
+          });
+          expect(decision.hookSpecificOutput).not.toMatchObject({ permissionDecision: 'deny' });
+        }
+      }
+    }
+    await handle.setPermissionMode?.('ask');
+    expect(fakeQuery.setPermissionMode).toHaveBeenCalledWith('default');
+    await handle.close();
+  });
+
   it('passes the same allowedTools snapshot to remote cc-manager start params', async () => {
     const configDir = await makeTempDir();
     process.env.CLAUDE_CONFIG_DIR = configDir;
@@ -568,7 +599,7 @@ describe('ClaudeCodeAgent plan mode', () => {
       imagePath,
       Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
     );
-    const remoteSend = vi.fn(async () => {});
+    const remoteSend = vi.fn(async (_message: unknown) => {});
     const fakeQuery = { ...createFakeQuery(), send: remoteSend };
     const remoteCcQueryFactory: NonNullable<AgentDeps['remoteCcQueryFactory']> = async () =>
       fakeQuery as never;
@@ -607,7 +638,7 @@ describe('ClaudeCodeAgent plan mode', () => {
     process.env.CLAUDE_CONFIG_DIR = configDir;
     const workingDir = await makeTempDir();
     const imagePath = path.join(workingDir, 'desktop.png');
-    const remoteSend = vi.fn(async () => {});
+    const remoteSend = vi.fn(async (_message: unknown) => {});
     const fakeQuery = { ...createFakeQuery(), send: remoteSend };
     const remoteCcQueryFactory: NonNullable<AgentDeps['remoteCcQueryFactory']> = async () =>
       fakeQuery as never;
@@ -660,7 +691,7 @@ describe('ClaudeCodeAgent plan mode', () => {
     process.env.CLAUDE_CONFIG_DIR = configDir;
     const workingDir = await makeTempDir();
     const imagePath = path.join(workingDir, 'desktop-steer.png');
-    const remoteSend = vi.fn(async () => {});
+    const remoteSend = vi.fn(async (_message: unknown) => {});
     const fakeQuery = { ...createFakeQuery(), send: remoteSend };
     const remoteCcQueryFactory: NonNullable<AgentDeps['remoteCcQueryFactory']> = async () =>
       fakeQuery as never;
@@ -710,6 +741,37 @@ describe('ClaudeCodeAgent plan mode', () => {
     await handle.close();
   });
 
+  it('passes the local session provider into spawn-time behavior flags', async () => {
+    const configDir = await makeTempDir();
+    process.env.CLAUDE_CONFIG_DIR = configDir;
+    const workingDir = await makeTempDir();
+    const fakeQuery = createFakeQuery();
+    sdkMock.query.mockReturnValue(fakeQuery);
+    const behaviorFlags = vi.fn((ctx: { sessionProviderId?: string | null }) => ({
+      ENABLE_TOOL_SEARCH: ctx.sessionProviderId === 'openrouter-custom' ? 'false' : 'auto',
+    }));
+    const agent = new ClaudeCodeAgent(createDeps({ runtimeConfig: { behaviorFlags } }));
+
+    const handle = await agent.startSession({
+      sessionId: 'session-local-custom-provider',
+      model: 'x-ai/grok-4.6',
+      providerId: 'openrouter-custom',
+      workingDir,
+      permissionMode: 'auto',
+    });
+
+    const env = sdkMock.query.mock.calls.at(-1)?.[0]?.options?.env as
+      | Record<string, string>
+      | undefined;
+    expect(env?.ENABLE_TOOL_SEARCH).toBe('false');
+    expect(behaviorFlags).toHaveBeenCalledWith({
+      credentialMode: 'provider-oauth',
+      sessionProviderId: 'openrouter-custom',
+      spawnMode: 'local',
+    });
+    await handle.close();
+  });
+
   it('overrides remote cc-manager env with a host-materialized Claude route', async () => {
     const configDir = await makeTempDir();
     process.env.CLAUDE_CONFIG_DIR = configDir;
@@ -728,9 +790,12 @@ describe('ClaudeCodeAgent plan mode', () => {
         ANTHROPIC_CUSTOM_HEADERS: 'authorization: Bearer k-route\nx-tenant: acme',
       },
     }));
+    const behaviorFlags = vi.fn((ctx: { sessionProviderId?: string | null }) => ({
+      ENABLE_TOOL_SEARCH: ctx.sessionProviderId === 'custom-provider' ? 'false' : 'auto',
+    }));
     const agent = new ClaudeCodeAgent(createDeps({
       // Empty gateway endpoint would fail the old remote gateway guard; routed sessions must not depend on it.
-      runtimeConfig: { remoteEndpoint: '' },
+      runtimeConfig: { remoteEndpoint: '', behaviorFlags },
       remoteCcQueryFactory,
       resolveRemoteClaudeRoute,
     }));
@@ -753,6 +818,12 @@ describe('ClaudeCodeAgent plan mode', () => {
     expect(env?.ANTHROPIC_API_KEY).toBe('k-route');
     expect(env?.ANTHROPIC_CUSTOM_HEADERS).toBe('authorization: Bearer k-route\nx-tenant: acme');
     expect(env?.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+    expect(env?.ENABLE_TOOL_SEARCH).toBe('false');
+    expect(behaviorFlags).toHaveBeenCalledWith({
+      credentialMode: 'provider-oauth',
+      sessionProviderId: 'custom-provider',
+      spawnMode: 'remote',
+    });
     await handle.close();
   });
 
@@ -862,7 +933,7 @@ describe('ClaudeCodeAgent plan mode', () => {
         return { authenticated: true };
       },
       async logout() {},
-      async getAuthEnv(options) {
+      async getAuthEnv(options): Promise<Record<string, string>> {
         return options?.credentialMode === 'gateway-key'
           ? { ANTHROPIC_API_KEY: 'gw-key' }
           : { CLAUDE_CODE_OAUTH_TOKEN: 'tok-sub' }; // 本地 fallback: 订阅已连
@@ -1092,7 +1163,8 @@ describe('ClaudeCodeAgent plan mode', () => {
 
     expect(reviewAutoPermissionAction).toHaveBeenCalledWith(expect.objectContaining({
       userIntent:
-        'Refactor the parser without changing public behavior\n\n'
+        'Earlier user messages (still apply unless explicitly changed below):\n'
+        + 'Refactor the parser without changing public behavior\n\nLatest user message:\n'
         + 'Approved plan:\n1. Inspect parser call sites\n2. Update parser\n3. Run focused tests',
     }));
     await handle.close();
@@ -1304,7 +1376,7 @@ describe('ClaudeCodeAgent plan mode', () => {
     // 后台刷新后 nextRoute.env 是新 token,但 remoteEnv(远端 daemon)还是旧值 ——
     // token 值轮换不算路由变化,同路由放行(codex P2 三轮)。
     let callCount = 0;
-    const resolveRemoteClaudeRoute = vi.fn(async () => {
+    const resolveRemoteClaudeRoute = vi.fn(async (): Promise<RemoteClaudeRoute> => {
       callCount += 1;
       return {
         endpoint: 'https://api.anthropic.com',
@@ -1340,7 +1412,7 @@ describe('ClaudeCodeAgent plan mode', () => {
     // 登录后 backfill 补齐 subscriptionType/rateLimitTier(用户零操作)—— 与 token 同组
     // 按存在性比对,不按值,不误拒(Fable 5 评估 B1)。
     let callCount = 0;
-    const resolveRemoteClaudeRoute = vi.fn(async () => {
+    const resolveRemoteClaudeRoute = vi.fn(async (): Promise<RemoteClaudeRoute> => {
       callCount += 1;
       return {
         endpoint: 'https://api.anthropic.com',
@@ -1419,7 +1491,7 @@ describe('ClaudeCodeAgent plan mode', () => {
     // 初次解析带 x-tenant 定制头;切模时目标路由把它删了 —— 远端 daemon 仍烤着旧头,
     // 必须拒绝(Greptile review #1035:只取 nextRoute 的 key 会把删除误判成一致)。
     let callCount = 0;
-    const resolveRemoteClaudeRoute = vi.fn(async () => {
+    const resolveRemoteClaudeRoute = vi.fn(async (): Promise<RemoteClaudeRoute> => {
       callCount += 1;
       return callCount === 1
         ? {

@@ -94,6 +94,11 @@ export interface AgentCapabilities {
    * device-link 老被控端序列化的 capabilities 无此字段 → undefined = 不支持。
    */
   planMode?: CapabilityStatus;
+  /**
+   * 会话级外部可写目录能力。device-link 老被控端无此字段 → undefined = 不支持，
+   * 控制端必须隐藏会触发新 channel 的入口。
+   */
+  writableDirs?: CapabilityStatus;
   /** Session fork — UserMessage 下方 Fork icon 据此显示 / 隐藏。 */
   fork?: CapabilityStatus;
   /** Session rewind — UserMessage 下方 Rewind icon 据此显示 / 隐藏。 */
@@ -115,6 +120,8 @@ export interface AgentCapabilities {
    * device-link 老被控端无此字段 → undefined，控制端必须阻止开启协同并提示升级。
    */
   supportsOrcaWorkerPermissionMode?: boolean;
+  /** 被控端支持把 UI initial_task 延后到 Lead 首条输入 accepted 后派发。 */
+  supportsDeferredOrcaUiAssignment?: boolean;
   /**
    * 手动压缩会话上下文能力(pi 原生 compact)。与 maker-core Capabilities.manualCompact
    * 同形；device-link 老被控端序列化的 capabilities 无此字段 → undefined = 不支持。
@@ -131,6 +138,19 @@ export interface AgentCapabilities {
     supported: CapabilityStatus;
     unsupportedPermissionModes: string[];
   };
+}
+
+/**
+ * 可写目录回调的跨端兼容门：本地沿用既有能力，SSH 等待远端 picker，device-link
+ * 只信任当前被控端明确声明的能力。缺字段、加载中与不支持都 fail closed。
+ */
+export function canExposeWritableDirsChange(options: {
+  capabilities: Pick<AgentCapabilities, 'writableDirs'> | null | undefined;
+  deviceId: string | null | undefined;
+  remoteHostId: string | null | undefined;
+}): boolean {
+  if (options.remoteHostId != null) return false;
+  return options.deviceId == null || options.capabilities?.writableDirs?.supported === true;
 }
 
 /**
@@ -250,9 +270,15 @@ function parseAgentCapabilities(value: unknown): AgentCapabilities {
   if (!isRecord(value)) {
     throw new Error('Invalid agent capabilities response');
   }
+  if (!Array.isArray(value.availableModels)) {
+    throw new Error('Invalid agent capabilities response');
+  }
+  // Same policy as the local model plane: drop a catalog row that cannot
+  // stand on its own (missing defaultEffort, extra junk) instead of
+  // rejecting the whole remote list. One stale model on the controlled
+  // machine was emptying the selector.
+  value.availableModels = value.availableModels.filter(isModelDescriptor);
   if (
-    !Array.isArray(value.availableModels) ||
-    !value.availableModels.every(isModelDescriptor) ||
     typeof value.hasFastMode !== 'boolean' ||
     !Array.isArray(value.effortLevels) ||
     !value.effortLevels.every(isNamedDescriptor) ||
@@ -261,6 +287,8 @@ function parseAgentCapabilities(value: unknown): AgentCapabilities {
     !isOptionalBoolean(value.supportsSessionAgentSwitch) ||
     !isOptionalBoolean(value.supportsSessionAgentSwitchCas) ||
     !isOptionalBoolean(value.supportsOrcaWorkerPermissionMode) ||
+    !isOptionalBoolean(value.supportsDeferredOrcaUiAssignment) ||
+    !isOptionalCapabilityStatus(value.writableDirs) ||
     !isOptionalCapabilityStatus(value.manualCompact)
   ) {
     throw new Error('Invalid agent capabilities response');
